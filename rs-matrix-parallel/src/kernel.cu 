@@ -1,0 +1,74 @@
+#include "rs_config.h"
+
+extern __constant__ unsigned short dc_log[2 * GF_FIELD_SIZE];
+extern __constant__ unsigned char dc_exp[2 * GF_FIELD_SIZE];
+
+// Force inline to reduce function call overhead
+__device__ __forceinline__ unsigned char gf_mul_opt(unsigned char a, unsigned char b) {
+    if (a == 0 || b == 0) return 0;
+    // Direct lookup, no modulo arithmetic needed due to extended table
+    return dc_exp[dc_log[a] + dc_log[b]];
+}
+
+/**
+ * Blocked Matrix Multiplication for RS Encoding
+ * Grid: (N-K) / TILE_DIM
+ * Block: (TILE_DIM, TILE_DIM)
+ */
+__global__ void rs_kernel_blocked(
+    const unsigned char* __restrict__ d_src,   // Flattened message blocks
+    const unsigned char* __restrict__ d_mat,   // Generator matrix
+    unsigned char* __restrict__ d_dst,         // Output parity
+    int k, int n
+) {
+    // Shared memory tiling to reuse generator matrix
+    __shared__ unsigned char s_mat_tile[TILE_DIM][TILE_DIM];
+    
+    int bx = blockIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int row = ty;               // Row index in current tile
+    int col = bx * TILE_DIM + tx; // Global parity column index
+
+    unsigned char p_val = 0; // Accumulator register
+
+    // Iterate over message blocks (K dimension)
+    int num_tiles = (k + TILE_DIM - 1) / TILE_DIM;
+
+    #pragma unroll 2 // Unroll loop for ILP
+    for (int m = 0; m < num_tiles; ++m) {
+        
+        // 1. Cooperative Load: Generator Matrix -> Shared Mem
+        // Boundary check included
+        int g_col = m * TILE_DIM + tx;
+        if (g_col < k && row < (n - k)) {
+            s_mat_tile[ty][tx] = d_mat[row * k + g_col];
+        } else {
+            s_mat_tile[ty][tx] = 0;
+        }
+        __syncthreads(); // Barrier
+
+        // 2. Load Message: Global -> Register
+        // Prefetching to hide latency
+        unsigned char m_val = 0;
+        int m_idx = m * TILE_DIM + ty;
+        if (m_idx < k) {
+            m_val = d_src[m_idx]; // TODO: Add coalescing padding later
+        }
+
+        // 3. Compute Dot Product
+        // Each thread computes partial XOR sum
+        for (int i = 0; i < TILE_DIM; ++i) {
+             unsigned char g_val = s_mat_tile[ty][i]; // Read from shared (fast)
+             p_val ^= gf_mul_opt(m_val, g_val);
+        }
+        
+        __syncthreads();
+    }
+
+    // 4. Store result
+    if (col < (n - k)) {
+        d_dst[col] = p_val;
+    }
+}
